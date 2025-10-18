@@ -24,6 +24,7 @@ import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.IndexableField;
 import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.queryparser.classic.ParseException;
 import org.apache.lucene.queryparser.classic.QueryParser;
@@ -163,13 +164,25 @@ public final class HybridSearcher implements Closeable {
   }
 
   private List<RankedHit> runBm25(String queryText, int topK) throws IOException {
+    QueryParser parser = new QueryParser(FIELD_CONTENT, analyzer);
     try {
-      QueryParser parser = new QueryParser(FIELD_CONTENT, analyzer);
       Query query = parser.parse(queryText);
       TopDocs docs = searcher.search(query, Math.max(1, topK));
       return toRankedHits(docs);
     } catch (ParseException e) {
-      throw new IOException("Failed to parse BM25 query", e);
+      String escaped = QueryParser.escape(queryText);
+      if (escaped.equals(queryText)) {
+        throw new IOException("Failed to parse BM25 query", e);
+      }
+      try {
+        Query query = parser.parse(escaped);
+        TopDocs docs = searcher.search(query, Math.max(1, topK));
+        return toRankedHits(docs);
+      } catch (ParseException ex) {
+        IOException failure = new IOException("Failed to parse BM25 query (even after escaping)", ex);
+        failure.addSuppressed(e);
+        throw failure;
+      }
     }
   }
 
@@ -193,7 +206,15 @@ public final class HybridSearcher implements Closeable {
   }
 
   private static Number numeric(Document doc, String field) {
-    return doc.getField(field).numericValue();
+    IndexableField stored = doc.getField(field);
+    if (stored == null) {
+      throw new IllegalStateException("Missing stored numeric field: " + field);
+    }
+    Number value = stored.numericValue();
+    if (value == null) {
+      throw new IllegalStateException("Stored field " + field + " has no numeric value");
+    }
+    return value;
   }
 
   private Path resolvePath(int ordinal) throws IOException {

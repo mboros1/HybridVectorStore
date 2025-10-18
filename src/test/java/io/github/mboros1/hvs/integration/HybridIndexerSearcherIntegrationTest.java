@@ -9,11 +9,17 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.List;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -31,27 +37,9 @@ final class HybridIndexerSearcherIntegrationTest {
 
   @Test
   void indexAndSearchUsingRealSampleShard() throws IOException {
-    Path samplesDir = Paths.get("samples");
-    Assumptions.assumeTrue(
-        Files.isDirectory(samplesDir), "samples/ directory must exist for integration test");
-
-    HybridIndexer indexer = new HybridIndexer();
-    int maxVectorDim = indexer.maxVectorDimension();
-    SampleContext context = locateSampleWithVectors(samplesDir, maxVectorDim);
-    Assumptions.assumeTrue(context != null, "No matching doc/vec shard pair found under samples/");
-
-    SamplePair pair = context.pair();
-    SampleFixture fixture = context.fixture();
-
-    Path indexDir = tempDir.resolve("index");
-    Path outputDir = tempDir.resolve("out");
-    Path sidecar = tempDir.resolve(pair.baseName() + ".idx");
-
-    HybridIndexer.ShardInput shardInput =
-        HybridIndexer.ShardInput.of(pair.docPath(), pair.vecPath()).withSidecar(sidecar);
-    HybridIndexer.IndexRequest request =
-        new HybridIndexer.IndexRequest(List.of(shardInput), indexDir, outputDir);
-    HybridIndexer.IndexStats stats = indexer.index(request);
+    IntegrationRun run = indexSampleShard();
+    HybridIndexer.IndexStats stats = run.stats();
+    SampleFixture fixture = run.context().fixture();
 
     assertTrue(stats.docsIndexed() > 0, "Expected at least one document indexed");
     assertEquals(
@@ -62,13 +50,14 @@ final class HybridIndexerSearcherIntegrationTest {
         fixture.projectedVector().length,
         stats.dimension(),
         "Vector dimension should match sample embedding length");
+    assertEquals(fixture.originalDimension(), stats.rawDimension());
+    assertEquals(0L, stats.duplicateVectors());
+    assertTrue(stats.truncated(), "Expected raw dimension truncation to occur");
 
-    Path manifest = outputDir.resolve("manifest.json");
-    Path pathsJson = outputDir.resolve("paths.json");
-    assertTrue(Files.exists(manifest), "manifest.json should be written");
-    assertTrue(Files.exists(pathsJson), "paths.json should be written");
+    assertTrue(Files.exists(run.manifest()), "manifest.json should be written");
+    assertTrue(Files.exists(run.pathsJson()), "paths.json should be written");
 
-    try (HybridSearcher searcher = new HybridSearcher(indexDir, pathsJson)) {
+    try (HybridSearcher searcher = new HybridSearcher(run.indexDir(), run.pathsJson())) {
       HybridSearcher.SearchRequest searchRequest =
           HybridSearcher.SearchRequest.builder()
               .text(fixture.queryToken())
@@ -105,6 +94,117 @@ final class HybridIndexerSearcherIntegrationTest {
     }
   }
 
+  @Test
+  void manifestAndSidecarMetadataRecorded() throws IOException {
+    IntegrationRun run = indexSampleShard();
+    HybridIndexer.IndexStats stats = run.stats();
+    SampleContext context = run.context();
+
+    long entries = stats.shardResults().get(0).totalLines();
+    long expectedSidecarBytes = entries * (Long.BYTES + Integer.BYTES);
+    assertEquals(expectedSidecarBytes, Files.size(run.sidecar()));
+
+    JsonNode manifest = MAPPER.readTree(run.manifest().toFile());
+    assertEquals(stats.docsIndexed(), manifest.path("docs").asLong());
+    assertEquals(stats.vectorsIndexed(), manifest.path("vectors").asLong());
+    assertEquals(stats.dimension(), manifest.path("dimension").asInt());
+    assertEquals(stats.rawDimension(), manifest.path("rawDimension").asInt());
+    assertTrue(manifest.path("vectorTruncated").asBoolean());
+    assertEquals(0L, manifest.path("duplicateVectors").asLong());
+
+    JsonNode sidecars = manifest.path("docSidecars");
+    assertTrue(sidecars.isArray() && sidecars.size() == 1);
+    JsonNode shardNode = sidecars.get(0);
+    assertEquals(stats.shardResults().get(0).rawDimension(), shardNode.path("rawDimension").asInt());
+    assertTrue(shardNode.path("vectorTruncated").asBoolean());
+    assertEquals(stats.shardResults().get(0).duplicateVectors(), shardNode.path("duplicateVectors").asLong());
+
+    Path docPath = context.pair().docPath();
+    HybridSearcher.SearchResult topResult;
+    try (HybridSearcher searcher = new HybridSearcher(run.indexDir(), run.pathsJson())) {
+      List<HybridSearcher.SearchResult> hits =
+          searcher.search(
+              HybridSearcher.SearchRequest.builder()
+                  .vector(context.fixture().projectedVector())
+                  .topK(5)
+                  .build());
+      assertFalse(hits.isEmpty());
+      topResult = hits.get(0);
+    }
+
+    HybridSearcher.DocPointer pointer = topResult.pointer();
+    try (FileChannel ch = FileChannel.open(pointer.path(), StandardOpenOption.READ)) {
+      ByteBuffer buf = ByteBuffer.allocate(pointer.length());
+      int read = ch.read(buf, pointer.offset());
+      assertEquals(pointer.length(), read);
+      buf.flip();
+      String json = StandardCharsets.UTF_8.decode(buf).toString();
+      JsonNode parsed = MAPPER.readTree(json);
+      assertEquals(topResult.id(), parsed.path("id").asText());
+    }
+
+    JsonNode manifestChecksums = manifest.path("checksums");
+    String sidecarRef = shardNode.path("idxPath").asText();
+    Path refPath = Paths.get(sidecarRef);
+    Path sidecarPath = refPath.isAbsolute() ? refPath : run.outputDir().resolve(refPath).normalize();
+    assertEquals(sha256(sidecarPath), manifestChecksums.path(sidecarRef).asText());
+  }
+
+  @Test
+  void specialCharacterQueryFallsBackToEscapedSearch() throws IOException {
+    IntegrationRun run = indexSampleShard();
+    String nasty =
+        run.context().fixture().queryToken() + " + - && || ! ( ) { } [ ] ^ \" ~ * ? : \\\\ /";
+    try (HybridSearcher searcher = new HybridSearcher(run.indexDir(), run.pathsJson())) {
+      HybridSearcher.SearchRequest request =
+          HybridSearcher.SearchRequest.builder().text(nasty).topK(5).build();
+      List<HybridSearcher.SearchResult> hits = searcher.search(request);
+      assertFalse(hits.isEmpty(), "Expected fallback parsing to return hits");
+    }
+  }
+
+  @Test
+  void annOnlyQueryReturnsMatches() throws IOException {
+    IntegrationRun run = indexSampleShard();
+    try (HybridSearcher searcher = new HybridSearcher(run.indexDir(), run.pathsJson())) {
+      HybridSearcher.SearchRequest request =
+          HybridSearcher.SearchRequest.builder()
+              .vector(run.context().fixture().projectedVector())
+              .text(null)
+              .topK(3)
+              .build();
+      List<HybridSearcher.SearchResult> hits = searcher.search(request);
+      assertFalse(hits.isEmpty(), "ANN-only query should return hits");
+    }
+  }
+
+  private IntegrationRun indexSampleShard() throws IOException {
+    Path samplesDir = Paths.get("samples");
+    Assumptions.assumeTrue(
+        Files.isDirectory(samplesDir), "samples/ directory must exist for integration test");
+
+    HybridIndexer indexer = new HybridIndexer();
+    SampleContext context = locateSampleWithVectors(samplesDir, indexer.maxVectorDimension());
+    Assumptions.assumeTrue(context != null, "No matching doc/vec shard pair found under samples/");
+
+    Path runRoot = Files.createTempDirectory(tempDir, "run-");
+    Path indexDir = runRoot.resolve("index");
+    Path outputDir = runRoot.resolve("out");
+    Files.createDirectories(indexDir);
+    Files.createDirectories(outputDir);
+    Path sidecar = runRoot.resolve(context.pair().baseName() + ".idx");
+
+    HybridIndexer.ShardInput shardInput =
+        HybridIndexer.ShardInput.of(context.pair().docPath(), context.pair().vecPath())
+            .withSidecar(sidecar);
+    HybridIndexer.IndexRequest request =
+        new HybridIndexer.IndexRequest(List.of(shardInput), indexDir, outputDir);
+    HybridIndexer.IndexStats stats = indexer.index(request);
+
+    Path manifest = outputDir.resolve("manifest.json");
+    Path pathsJson = outputDir.resolve("paths.json");
+    return new IntegrationRun(context, stats, indexDir, outputDir, manifest, pathsJson, sidecar);
+  }
   private static SampleContext locateSampleWithVectors(Path samplesDir, int maxDimension)
       throws IOException {
     try (DirectoryStream<Path> docStream = Files.newDirectoryStream(samplesDir, "*" + DOC_SUFFIX)) {
@@ -203,4 +303,35 @@ final class HybridIndexerSearcherIntegrationTest {
   private record VectorInfo(int originalDimension, float[] projected) {}
 
   private record SampleContext(SamplePair pair, SampleFixture fixture) {}
+
+  private record IntegrationRun(
+      SampleContext context,
+      HybridIndexer.IndexStats stats,
+      Path indexDir,
+      Path outputDir,
+      Path manifest,
+      Path pathsJson,
+      Path sidecar) {}
+
+  private static String sha256(Path path) throws IOException {
+    MessageDigest digest;
+    try {
+      digest = MessageDigest.getInstance("SHA-256");
+    } catch (NoSuchAlgorithmException e) {
+      throw new IllegalStateException("Missing SHA-256 provider", e);
+    }
+    try (InputStream in = Files.newInputStream(path)) {
+      byte[] buffer = new byte[8192];
+      int read;
+      while ((read = in.read(buffer)) != -1) {
+        digest.update(buffer, 0, read);
+      }
+    }
+    byte[] hash = digest.digest();
+    StringBuilder sb = new StringBuilder(hash.length * 2);
+    for (byte b : hash) {
+      sb.append(String.format("%02x", b));
+    }
+    return sb.toString();
+  }
 }

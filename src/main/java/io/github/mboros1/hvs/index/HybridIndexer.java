@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -59,6 +58,9 @@ public final class HybridIndexer {
   private static final String FIELD_OFFSET = "off";
   private static final String FIELD_LENGTH = "len";
   private static final String FIELD_PREVIEW = "preview";
+  private static final String FIELD_PATH_ORD_DV = "path_ord_dv";
+  private static final String FIELD_OFFSET_DV = "off_dv";
+  private static final String FIELD_LENGTH_DV = "len_dv";
 
   private final ObjectMapper mapper;
   private final int maxVectorDimension;
@@ -93,6 +95,9 @@ public final class HybridIndexer {
     long missingVectors = 0;
     long vectorsIngested = 0;
     int dimension = -1;
+    int rawDimension = -1;
+    boolean truncated = false;
+    long duplicateVectors = 0;
 
     List<ShardResult> shardResults = new ArrayList<>();
 
@@ -105,12 +110,23 @@ public final class HybridIndexer {
         indexedDocs += result.indexedDocs();
         missingVectors += result.missingVectors();
         vectorsIngested += result.vectorsConsumed();
+        duplicateVectors += result.duplicateVectors();
         if (dimension < 0) {
           dimension = result.dimension();
         } else if (result.dimension() > 0 && result.dimension() != dimension) {
           throw new IOException(
               "Vector dimension mismatch: expected " + dimension + " got " + result.dimension());
         }
+        if (rawDimension < 0) {
+          rawDimension = result.rawDimension();
+        } else if (result.rawDimension() > 0 && result.rawDimension() != rawDimension) {
+          throw new IOException(
+              "Raw vector dimension mismatch: expected "
+                  + rawDimension
+                  + " got "
+                  + result.rawDimension());
+        }
+        truncated |= result.truncated();
         shardResults.add(result);
       }
       writer.commit();
@@ -121,14 +137,26 @@ public final class HybridIndexer {
 
     Path manifest = request.outputDir().resolve("manifest.json");
     writeManifest(
-        manifest, pathsJson, request.indexDir(), shardResults, indexedDocs, vectorsIngested, dimension);
+        manifest,
+        pathsJson,
+        request.indexDir(),
+        shardResults,
+        indexedDocs,
+        vectorsIngested,
+        dimension,
+        rawDimension,
+        truncated,
+        duplicateVectors);
 
     return new IndexStats(
         indexedDocs,
         totalDocs - indexedDocs,
         missingVectors,
         vectorsIngested,
+        duplicateVectors,
         dimension,
+        rawDimension,
+        truncated,
         request.indexDir(),
         manifest,
         List.copyOf(shardResults));
@@ -141,7 +169,10 @@ public final class HybridIndexer {
       List<ShardResult> shardResults,
       long docsIndexed,
       long vectorsIndexed,
-      int dimension)
+      int dimension,
+      int rawDimension,
+      boolean truncated,
+      long duplicateVectors)
       throws IOException {
     Path parentDir = manifestPath.getParent();
     if (parentDir != null) {
@@ -151,6 +182,11 @@ public final class HybridIndexer {
     root.put("docs", docsIndexed);
     root.put("vectors", vectorsIndexed);
     root.put("dimension", dimension);
+    if (dimension >= 0) {
+      root.put("rawDimension", rawDimension);
+      root.put("vectorTruncated", truncated);
+    }
+    root.put("duplicateVectors", duplicateVectors);
     root.put("dtype", "f32");
     Path manifestDir = manifestPath.getParent();
     String pathsRef = relativizeOrAbsolute(manifestDir, pathsJson);
@@ -172,6 +208,10 @@ public final class HybridIndexer {
       String checksum = sha256(shard.docIndexPath());
       node.put("checksum", checksum);
       checksums.put(idxRef, checksum);
+      node.put("dimension", shard.dimension());
+      node.put("rawDimension", shard.rawDimension());
+      node.put("vectorTruncated", shard.truncated());
+      node.put("duplicateVectors", shard.duplicateVectors());
     }
 
     mapper.writerWithDefaultPrettyPrinter().writeValue(manifestPath.toFile(), root);
@@ -266,9 +306,9 @@ public final class HybridIndexer {
           doc.add(
               new KnnFloatVectorField(
                   FIELD_VECTOR, vector, VectorSimilarityFunction.DOT_PRODUCT));
-          doc.add(new NumericDocValuesField(FIELD_PATH_ORD, pathOrd));
-          doc.add(new NumericDocValuesField(FIELD_OFFSET, line.offset()));
-          doc.add(new NumericDocValuesField(FIELD_LENGTH, line.length()));
+          doc.add(new NumericDocValuesField(FIELD_PATH_ORD_DV, pathOrd));
+          doc.add(new NumericDocValuesField(FIELD_OFFSET_DV, line.offset()));
+          doc.add(new NumericDocValuesField(FIELD_LENGTH_DV, line.length()));
           doc.add(new StoredField(FIELD_PATH_ORD, pathOrd));
           doc.add(new StoredField(FIELD_OFFSET, line.offset()));
           doc.add(new StoredField(FIELD_LENGTH, line.length()));
@@ -292,7 +332,10 @@ public final class HybridIndexer {
           indexedDocs,
           missingVectors,
           vectors.consumedCount(),
-          vectors.dimension());
+          vectors.dimension(),
+          vectors.rawDimension(),
+          vectors.truncated(),
+          vectors.duplicateVectors());
     }
   }
 
@@ -311,7 +354,8 @@ public final class HybridIndexer {
     Map<String, float[]> vectors = new HashMap<>();
     int dimension = -1;
     int rawDimension = -1;
-    AtomicBoolean truncated = new AtomicBoolean(false);
+    boolean truncated = false;
+    long duplicates = 0L;
     long count = 0;
     try (DocLineReader reader = new DocLineReader(vectorPath)) {
       Optional<DocLine> maybeLine;
@@ -345,7 +389,7 @@ public final class HybridIndexer {
         }
         int effectiveLen = Math.min(len, maxVectorDimension);
         if (effectiveLen < len) {
-          truncated.set(true);
+          truncated = true;
         }
         if (dimension < 0) {
           dimension = effectiveLen;
@@ -376,11 +420,14 @@ public final class HybridIndexer {
         for (int i = 0; i < effectiveLen; i++) {
           vector[i] *= scale;
         }
-        vectors.put(id, vector);
+        float[] previous = vectors.put(id, vector);
+        if (previous != null) {
+          duplicates++;
+        }
         count++;
       }
     }
-    if (truncated.get()) {
+    if (truncated) {
       LOG.warn(
           "Detected vector dimension {} in {} exceeding maximum {}; truncating to {}",
           rawDimension,
@@ -388,7 +435,13 @@ public final class HybridIndexer {
           maxVectorDimension,
           dimension);
     }
-    return new VectorData(vectors, dimension, count);
+    if (duplicates > 0) {
+      LOG.warn(
+          "Vector file {} contains {} duplicate id entries; using last occurrence values",
+          vectorPath,
+          duplicates);
+    }
+    return new VectorData(vectors, dimension, count, rawDimension, truncated, duplicates);
   }
 
   private static String extractText(JsonNode node) {
@@ -427,7 +480,13 @@ public final class HybridIndexer {
     }
   }
 
-  private record VectorData(Map<String, float[]> vectors, int dimension, long count) {
+  private record VectorData(
+      Map<String, float[]> vectors,
+      int dimension,
+      long count,
+      int rawDimension,
+      boolean truncated,
+      long duplicateVectors) {
     float[] consume(String id) {
       return vectors.remove(id);
     }
@@ -482,39 +541,103 @@ public final class HybridIndexer {
   }
 
   private static final class DocLineReader implements AutoCloseable {
-    private final InputStream in;
-    private long offset = 0L;
+    private static final int BUFFER_SIZE = 1 << 16; // 64 KiB
+
+    private final FileChannel channel;
+    private final byte[] buffer = new byte[BUFFER_SIZE];
+    private int bufPos = 0;
+    private int bufLen = 0;
+    private long bufOffset = 0L;
+    private boolean eof = false;
 
     DocLineReader(Path path) throws IOException {
-      this.in = Files.newInputStream(path);
+      this.channel =
+          FileChannel.open(path, StandardOpenOption.READ);
     }
 
     Optional<DocLine> next() throws IOException {
-      ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-      long lineOffset = offset;
-      boolean sawData = false;
-      while (true) {
-        int b = in.read();
-        if (b == -1) {
-          break;
-        }
-        sawData = true;
-        buffer.write(b);
-        offset++;
-        if (b == '\n') {
-          break;
-        }
-      }
-      if (!sawData && buffer.size() == 0) {
+      if (!ensureData()) {
         return Optional.empty();
       }
-      byte[] bytes = buffer.toByteArray();
-      return Optional.of(new DocLine(lineOffset, bytes.length, bytes));
+      long lineOffset = bufOffset + bufPos;
+      ByteArrayOutputStream spill = null;
+
+      while (true) {
+        for (int i = bufPos; i < bufLen; i++) {
+          if (buffer[i] == '\n') {
+            int end = i + 1;
+            int length = end - bufPos;
+            byte[] bytes;
+            if (spill != null) {
+              spill.write(buffer, bufPos, length);
+              bytes = spill.toByteArray();
+            } else {
+              bytes = new byte[length];
+              System.arraycopy(buffer, bufPos, bytes, 0, length);
+            }
+            bufPos = end;
+            return Optional.of(new DocLine(lineOffset, bytes.length, bytes));
+          }
+        }
+        // No newline found in current buffer slice
+        int chunk = bufLen - bufPos;
+        if (chunk > 0) {
+          if (spill == null) {
+            spill = new ByteArrayOutputStream(Math.max(chunk * 2, 128));
+          }
+          spill.write(buffer, bufPos, chunk);
+        }
+        bufPos = bufLen;
+        if (!ensureData()) {
+          if (spill != null && spill.size() > 0) {
+            byte[] bytes = spill.toByteArray();
+            return Optional.of(new DocLine(lineOffset, bytes.length, bytes));
+          } else if (chunk > 0) {
+            byte[] bytes = new byte[chunk];
+            System.arraycopy(buffer, bufPos - chunk, bytes, 0, chunk);
+            return Optional.of(new DocLine(lineOffset, bytes.length, bytes));
+          }
+          return Optional.empty();
+        }
+      }
+    }
+
+    private boolean ensureData() throws IOException {
+      if (bufPos < bufLen) {
+        return true;
+      }
+      if (eof) {
+        return false;
+      }
+      refill();
+      return bufLen > 0;
+    }
+
+    private void refill() throws IOException {
+      if (bufPos > 0 && bufPos < bufLen) {
+        int remaining = bufLen - bufPos;
+        System.arraycopy(buffer, bufPos, buffer, 0, remaining);
+        bufOffset += bufPos;
+        bufPos = 0;
+        bufLen = remaining;
+      } else {
+        bufOffset += bufLen;
+        bufPos = 0;
+        bufLen = 0;
+      }
+
+      ByteBuffer byteBuffer = ByteBuffer.wrap(buffer, bufLen, buffer.length - bufLen);
+      int read = channel.read(byteBuffer);
+      if (read == -1) {
+        eof = true;
+        return;
+      }
+      bufLen += read;
     }
 
     @Override
     public void close() throws IOException {
-      in.close();
+      channel.close();
     }
   }
 
@@ -567,7 +690,10 @@ public final class HybridIndexer {
       long docsSkipped,
       long missingVectors,
       long vectorsIndexed,
+      long duplicateVectors,
       int dimension,
+      int rawDimension,
+      boolean truncated,
       Path indexDir,
       Path manifestPath,
       List<ShardResult> shardResults) {}
@@ -579,7 +705,10 @@ public final class HybridIndexer {
       long indexedDocs,
       long missingVectors,
       long vectorsConsumed,
-      int dimension) {}
+      int dimension,
+      int rawDimension,
+      boolean truncated,
+      long duplicateVectors) {}
 
   public int maxVectorDimension() {
     return maxVectorDimension;
